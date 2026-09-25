@@ -36,6 +36,9 @@ class Config:
     discovery_timeout: int = 1
     state_dir: str = "/data"
     verify_tls: bool = True
+    snmp: bool = True
+    scan: bool = True
+    scan_timeout: float = 0.8
     hosts: list[str] = field(default_factory=list)
 
     @property
@@ -45,6 +48,48 @@ class Config:
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def _flag(name: str, default: bool) -> bool:
+    value = _env(name).lower()
+    return default if value == "" else value not in ("0", "false", "no", "off")
+
+
+def load_env_file(path: str) -> None:
+    """KEY=value lines (Docker --env-file format) into os.environ; real environment variables win."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        raise ConfigError(f"Can't read settings file {path!r}: {e}") from e
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            os.environ.setdefault(key, value)
+
+
+def default_state_dir() -> str:
+    if os.name == "nt":
+        return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "LiveTracker", "collector")
+    return "/data"
+
+
+def auto_targets() -> list[str]:
+    """LT_TARGETS=auto: the /24 this machine is on."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))  # picks the outbound interface; nothing is sent
+            ip = s.getsockname()[0]
+    except OSError as e:
+        raise ConfigError(f"LT_TARGETS=auto couldn't work out this machine's network: {e}") from e
+    return [str(ipaddress.ip_network(f"{ip}/24", strict=False))]
 
 
 def expand_targets(spec: list[str]) -> list[str]:
@@ -81,13 +126,15 @@ def load() -> Config:
     url = _env("LT_URL")
     token = _env("LT_TOKEN")
     targets = [t for t in re.split(r"[,\s]+", _env("LT_TARGETS")) if t]
+    if [t.lower() for t in targets] == ["auto"]:
+        targets = auto_targets()
 
     if not url.startswith("https://") and not _env("LT_ALLOW_HTTP"):
         raise ConfigError("LT_URL must be the https:// address of LiveTracker (e.g. https://livetracker.uk)")
     if not re.fullmatch(r"ltc_\d+_[A-Za-z0-9]{48}", token):
         raise ConfigError("LT_TOKEN is missing or malformed - copy it from LiveTracker > Connectors > Network collector")
     if not targets:
-        raise ConfigError("LT_TARGETS is empty - set the subnets/IPs to poll, e.g. 192.168.1.0/24")
+        raise ConfigError("LT_TARGETS is empty - set the subnets/IPs to poll, e.g. 192.168.1.0/24 (or auto)")
 
     cfg = Config(
         url=url,
@@ -105,15 +152,19 @@ def load() -> Config:
         timeout=max(1, int(_env("SNMP_TIMEOUT", "2"))),
         retries=max(0, int(_env("SNMP_RETRIES", "1"))),
         discovery_timeout=max(1, int(_env("SNMP_DISCOVERY_TIMEOUT", "1"))),
-        state_dir=_env("LT_STATE_DIR", "/data"),
+        state_dir=_env("LT_STATE_DIR") or default_state_dir(),
         verify_tls=_env("LT_VERIFY_TLS", "true").lower() not in ("0", "false", "no"),
+        scan=_flag("LT_SCAN", True),
+        scan_timeout=min(5.0, max(0.2, float(_env("LT_SCAN_TIMEOUT", "0.8")))),
     )
 
     if cfg.snmp_version not in ("3", "2c", "1"):
         raise ConfigError("SNMP_VERSION must be 3, 2c or 1")
-    if cfg.snmp_version == "3":
-        if not cfg.snmp_user:
-            raise ConfigError("SNMP_USER is required for SNMPv3")
+    # SNMP is optional: without credentials the collector only runs the network scan.
+    cfg.snmp = _flag("LT_SNMP", True) and bool(cfg.snmp_user if cfg.snmp_version == "3" else cfg.community)
+    if not cfg.snmp and not cfg.scan:
+        raise ConfigError("Nothing to do - set SNMP credentials (SNMP_USER / SNMP_COMMUNITY) or leave LT_SCAN on")
+    if cfg.snmp and cfg.snmp_version == "3":
         if cfg.auth_pass and cfg.auth_proto not in AUTH_PROTOCOLS:
             raise ConfigError(f"SNMP_AUTH_PROTO must be one of {sorted(AUTH_PROTOCOLS)}")
         if cfg.priv_pass and cfg.priv_proto not in PRIV_PROTOCOLS:
@@ -124,8 +175,6 @@ def load() -> Config:
             value = getattr(cfg, name)
             if value and len(value) < 8:
                 raise ConfigError(f"SNMP_{name.upper()} must be at least 8 characters (SNMPv3 rule)")
-    elif not cfg.community:
-        raise ConfigError("SNMP_COMMUNITY is required for SNMP v1/v2c")
 
     cfg.hosts = expand_targets(cfg.targets)
     return cfg

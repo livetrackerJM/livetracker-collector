@@ -1,8 +1,9 @@
-"""Poll loop: discover -> profile -> report, every LT_INTERVAL seconds.
+"""Poll loop: SNMP poll + network scan -> report, every LT_INTERVAL seconds.
 
   python -m collector            run forever (the container default)
   python -m collector --once     one cycle then exit
   python -m collector --dry-run  one cycle, print the report JSON, send nothing
+  python -m collector --env-file collector.env   read settings from a file (default: ./collector.env if present)
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import signal
 import socket
 import ssl
@@ -24,13 +26,16 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from . import __version__
-from .config import Config, ConfigError, load
+from . import scan as netscan
+from .config import Config, ConfigError, load, load_env_file
 from .probe import SYSTEM_OIDS, Device, probe
 from .snmp import SnmpClient, SnmpTimeout
 
 log = logging.getLogger("collector")
 
 FORGET_AFTER = timedelta(days=30)
+# Phones, laptops, TVs come and go - forget them sooner than infrastructure.
+FORGET_INTERMITTENT_AFTER = timedelta(days=14)
 _stop = False
 
 
@@ -94,11 +99,13 @@ def discover(client: SnmpClient, cfg: Config, known_ips: set[str]) -> dict[str, 
     return found
 
 
-def cycle(client: SnmpClient, cfg: Config, state: State) -> dict:
+def cycle(client: SnmpClient | None, cfg: Config, state: State, scanner=netscan.scan, oui: netscan.OuiDatabase | None = None) -> dict:
     started = _now()
     known_ips = {d.get("ip") for d in state.devices.values()}
-    responders = discover(client, cfg, known_ips)
-    log.info("Sweep of %d targets: %d answered SNMP", len(cfg.hosts), len(responders))
+    responders = discover(client, cfg, known_ips) if client and cfg.snmp else {}
+    if client and cfg.snmp:
+        log.info("Sweep of %d targets: %d answered SNMP", len(cfg.hosts), len(responders))
+    found = scanner(cfg.hosts, workers=min(128, cfg.workers * 2), timeout=cfg.scan_timeout) if cfg.scan else {}
 
     def profile(item):
         ip, system = item
@@ -124,9 +131,24 @@ def cycle(client: SnmpClient, cfg: Config, state: State) -> dict:
             "model": dev.model, "serial": dev.serial, "firmware": dev.firmware, "os": dev.os,
             "location": dev.location, "contact": dev.contact, "health": dev.health, "detail": dev.detail or None,
             "uptime_seconds": dev.uptime_seconds, "last_seen": now_iso, "metrics": dev.metrics or None,
+            "mac": found[dev.ip].mac if dev.ip in found else None, "discovery": "snmp",
         }
         state.devices[dev.key] = {**record, "last_seen": now_iso}
         report_devices.append({k: v for k, v in record.items() if v is not None})
+
+    # Everything else the network scan found (SNMP devices keep their fuller SNMP record).
+    snmp_ips = {dev.ip for dev in devices}
+    oui = oui or netscan.OuiDatabase(cfg.state_dir)
+    for ip, host in found.items():
+        if ip in snmp_ips:
+            continue
+        record = {**netscan.describe(host, oui), "last_seen": now_iso}
+        # the MAC-based key keeps a device one asset when DHCP gives it a new address
+        if record["key"] in seen_keys:
+            continue
+        seen_keys.add(record["key"])
+        state.devices[record["key"]] = record
+        report_devices.append(record)
 
     # Previously-seen devices that didn't answer this time: report them as down
     # (so LiveTracker shows "Not responding") until they're 30 days gone.
@@ -134,17 +156,26 @@ def cycle(client: SnmpClient, cfg: Config, state: State) -> dict:
         if key in seen_keys:
             continue
         last = datetime.fromisoformat(saved["last_seen"])
-        if started - last > FORGET_AFTER or saved.get("ip") not in cfg.hosts:
+        scanned = saved.get("discovery") == "scan"
+        intermittent = scanned and saved.get("presence") == "intermittent"
+        forget_after = FORGET_INTERMITTENT_AFTER if intermittent else FORGET_AFTER
+        if started - last > forget_after or saved.get("ip") not in cfg.hosts or (scanned and not cfg.scan):
             del state.devices[key]
             state.counters.pop(key, None)
             continue
-        down = {k: v for k, v in saved.items() if v is not None and k not in ("health", "detail", "metrics")}
-        down.update({"health": "crit", "detail": "Not responding to SNMP", "last_seen": saved["last_seen"]})
+        down = {k: v for k, v in saved.items() if v is not None and k not in ("health", "detail", "metrics", "services")}
+        if intermittent:
+            # switched off or gone home - not a fault
+            down.update({"health": "healthy", "online": False, "detail": "Offline", "last_seen": saved["last_seen"]})
+        else:
+            down.update({"health": "crit", "online": False, "last_seen": saved["last_seen"],
+                         "detail": "Not responding" if scanned else "Not responding to SNMP"})
         report_devices.append(down)
 
     state.save()
     return {
-        "collector": {"version": __version__, "hostname": socket.gethostname(), "interval": cfg.interval, "targets": len(cfg.hosts)},
+        "collector": {"version": __version__, "hostname": socket.gethostname()[:120], "interval": cfg.interval,
+                      "targets": len(cfg.hosts), "snmp": bool(client and cfg.snmp), "scan": cfg.scan},
         "devices": report_devices,
     }
 
@@ -184,19 +215,31 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="collector", description="LiveTracker network collector")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit")
     parser.add_argument("--dry-run", action="store_true", help="run one cycle, print the report, send nothing")
+    parser.add_argument("--env-file", help="settings file (KEY=value lines); default ./collector.env if it exists")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+                        format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
     try:
+        env_file = args.env_file or ("collector.env" if os.path.exists("collector.env") else None)
+        if env_file:
+            load_env_file(env_file)
         cfg = load()
     except ConfigError as e:
         log.error("Configuration error: %s", e)
         return 2
 
-    log.info("LiveTracker Collector %s - %d targets, every %ds, SNMP v%s", __version__, len(cfg.hosts), cfg.interval, cfg.snmp_version)
-    client = SnmpClient(cfg)
+    if cfg.snmp and not shutil.which("snmpget"):
+        log.warning("SNMP settings found but the net-snmp tools (snmpget) aren't installed - SNMP polling is off")
+        cfg.snmp = False
+    if not cfg.snmp and not cfg.scan:
+        log.error("Nothing to do - SNMP is unavailable and LT_SCAN is off")
+        return 2
+
+    log.info("LiveTracker Collector %s - %d targets, every %ds, SNMP %s, network scan %s", __version__, len(cfg.hosts),
+             cfg.interval, f"v{cfg.snmp_version}" if cfg.snmp else "off", "on" if cfg.scan else "off")
+    client = SnmpClient(cfg) if cfg.snmp else None
     state = State(cfg.state_dir)
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)

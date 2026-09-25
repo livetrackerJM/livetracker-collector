@@ -115,7 +115,7 @@ def hp_printer():
 
 def make_cfg(state_dir, hosts):
     return Config(url="https://livetracker.example", token=TOKEN, targets=hosts, snmp_version="2c",
-                  community="public", hosts=hosts, state_dir=state_dir, workers=4)
+                  community="public", hosts=hosts, state_dir=state_dir, workers=4, scan=False)
 
 
 class ParseTests(unittest.TestCase):
@@ -148,10 +148,69 @@ class ConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             cfg = config_mod.load()
             self.assertEqual(cfg.hosts, ["192.168.1.1", "192.168.1.2"])
-        for bad in ({"LT_TOKEN": "nope"}, {"LT_URL": "http://insecure"}, {"SNMP_AUTH_PASS": "short"}, {"SNMP_USER": ""}):
+        for bad in ({"LT_TOKEN": "nope"}, {"LT_URL": "http://insecure"}, {"SNMP_AUTH_PASS": "short"},
+                    {"SNMP_USER": "", "LT_SCAN": "off"}):
             with mock.patch.dict(os.environ, {**env, **bad}, clear=True):
                 with self.assertRaises(ConfigError):
                     config_mod.load()
+
+    def test_snmp_is_optional_with_the_network_scan(self):
+        env = {"LT_URL": "https://livetracker.example", "LT_TOKEN": TOKEN, "LT_TARGETS": "192.168.1.0/30"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = config_mod.load()
+        self.assertEqual((cfg.snmp, cfg.scan), (False, True))
+
+    def test_env_file_and_auto_targets(self):
+        path = os.path.join(tempfile.mkdtemp(), "collector.env")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# comment\nLT_URL=https://livetracker.example\nLT_TOKEN=\"{TOKEN}\"\nLT_TARGETS=auto\nnot a setting\n")
+        with mock.patch.dict(os.environ, {"LT_URL": "https://wins.example"}, clear=True), \
+                mock.patch.object(config_mod, "auto_targets", return_value=["192.168.7.0/30"]):
+            config_mod.load_env_file(path)
+            cfg = config_mod.load()
+        self.assertEqual(cfg.url, "https://wins.example")  # real environment variables win
+        self.assertEqual(cfg.token, TOKEN)
+        self.assertEqual(cfg.hosts, ["192.168.7.1", "192.168.7.2"])
+
+
+def assert_contract(test, report):
+    """Mirror of the validation rules in LiveTracker's CollectorReportController."""
+    import ipaddress
+    from datetime import datetime
+    test.assertIsInstance(report["devices"], list)
+    allowed = {"key", "ip", "name", "type", "vendor", "model", "serial", "firmware", "os", "location", "contact",
+               "health", "detail", "uptime_seconds", "last_seen", "metrics", "mac", "discovery", "presence", "online", "services"}
+    limits = {"key": 191, "name": 255, "vendor": 255, "model": 255, "serial": 255, "firmware": 60, "os": 60,
+              "location": 255, "contact": 255, "detail": 255}
+    types = ("windows", "mac", "mobile", "server", "router", "switch", "nas", "printer", "ups", "tv", "smart", "other")
+    for d in report["devices"]:
+        test.assertLessEqual(set(d), allowed)
+        test.assertIn(d["type"], types)
+        test.assertIn(d["health"], ("healthy", "warn", "crit"))
+        test.assertTrue(d["key"])
+        test.assertIn(d.get("discovery", "snmp"), ("snmp", "scan"))
+        test.assertIn(d.get("presence", "always"), ("always", "intermittent"))
+        for k, n in limits.items():
+            if k in d:
+                test.assertIsInstance(d[k], str, k)
+                test.assertLessEqual(len(d[k]), n, k)
+        if "ip" in d:
+            ipaddress.ip_address(d["ip"])
+        if "mac" in d:
+            test.assertRegex(d["mac"], r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+        if "online" in d:
+            test.assertIsInstance(d["online"], bool)
+        if "services" in d:
+            test.assertLessEqual(len(d["services"]), 20)
+            for name in d["services"]:
+                test.assertLessEqual(len(name), 40)
+        if "uptime_seconds" in d:
+            test.assertIsInstance(d["uptime_seconds"], int)
+        datetime.fromisoformat(d["last_seen"])
+    c = report["collector"]
+    test.assertTrue(60 <= c["interval"] <= 86400)
+    test.assertLessEqual(len(c["version"]), 40)
+    test.assertLessEqual(len(c["hostname"]), 120)
 
 
 class CycleTests(unittest.TestCase):
@@ -225,37 +284,54 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(dev["name"], "core-sw")
 
     def test_report_matches_livetracker_contract(self):
-        """Mirror of the validation rules in LiveTracker's CollectorReportController."""
-        import ipaddress
-        from datetime import datetime
         agents = {"10.0.0.2": synology(), "10.0.0.3": netgear(), "10.0.0.4": idrac(), "10.0.0.5": apc_ups(), "10.0.0.6": hp_printer()}
         report, _ = self.run_cycle(agents, [f"10.0.0.{i}" for i in range(2, 7)])
-        self.assertIsInstance(report["devices"], list)
-        allowed = {"key", "ip", "name", "type", "vendor", "model", "serial", "firmware", "os", "location", "contact",
-                   "health", "detail", "uptime_seconds", "last_seen", "metrics"}
-        limits = {"key": 191, "name": 255, "vendor": 255, "model": 255, "serial": 255, "firmware": 60, "os": 60,
-                  "location": 255, "contact": 255, "detail": 255}
-        for d in report["devices"]:
-            self.assertLessEqual(set(d), allowed)
-            self.assertIn(d["type"], ("switch", "server", "nas", "printer", "ups", "other"))
-            self.assertIn(d["health"], ("healthy", "warn", "crit"))
-            self.assertTrue(d["key"])
-            for k, n in limits.items():
-                if k in d:
-                    self.assertIsInstance(d[k], str, k)
-                    self.assertLessEqual(len(d[k]), n, k)
-            if "ip" in d:
-                ipaddress.ip_address(d["ip"])
-            if "uptime_seconds" in d:
-                self.assertIsInstance(d["uptime_seconds"], int)
-            datetime.fromisoformat(d["last_seen"])
-        c = report["collector"]
-        self.assertTrue(60 <= c["interval"] <= 86400)
-        self.assertLessEqual(len(c["version"]), 40)
+        assert_contract(self, report)
+
+    def test_network_scan_merges_with_snmp_and_handles_devices_leaving(self):
+        from collector import scan as netscan
+        hosts = [f"10.0.0.{i}" for i in range(1, 8)]
+        phone = netscan.Host("10.0.0.7", mac="da:a1:19:00:00:01", responded=False, mdns_names=["Jo's iPhone"])
+        router = netscan.Host("10.0.0.1", mac="00:1d:d8:00:00:01", open_ports={53, 80, 443}, gateway=True,
+                              upnp={"friendlyName": "BT Smart Hub 2", "manufacturer": "Sagemcom", "modelName": "Smart Hub 2",
+                                    "deviceType": "urn:schemas-upnp-org:device:InternetGatewayDevice:1"})
+        nas_seen = netscan.Host("10.0.0.2", mac="00:11:32:00:00:02", open_ports={5000, 445})
+        present = {"10.0.0.1": router, "10.0.0.2": nas_seen, "10.0.0.7": phone}
+
+        cfg = make_cfg(self.tmp, hosts)
+        cfg.scan = True
+        oui = netscan.OuiDatabase(self.tmp, download=False)
+        oui._db = netscan.parse_manuf("00:11:32\tSynology\tSynology Incorporated\n00:1D:D8\tMicrosoft\tMicrosoft Corporation\n")
+        client = SnmpClient(cfg, runner=FakeAgents({"10.0.0.2": synology()}))
+
+        report = cycle(client, cfg, State(self.tmp), scanner=lambda *a, **k: present, oui=oui)
+        d = self.by_ip(report)
+        self.assertEqual(len(d), 3)
+        self.assertEqual((d["10.0.0.2"]["discovery"], d["10.0.0.2"]["mac"], d["10.0.0.2"]["type"]), ("snmp", "00:11:32:00:00:02", "nas"))
+        self.assertEqual((d["10.0.0.1"]["type"], d["10.0.0.1"]["name"], d["10.0.0.1"]["vendor"], d["10.0.0.1"]["key"]),
+                         ("router", "BT Smart Hub 2", "Sagemcom", "mac:00:1d:d8:00:00:01"))
+        self.assertEqual((d["10.0.0.7"]["type"], d["10.0.0.7"]["name"], d["10.0.0.7"]["presence"]), ("mobile", "Jo's iPhone", "intermittent"))
+        self.assertIn("Private Wi-Fi address", d["10.0.0.7"]["detail"])
+        assert_contract(self, report)
+
+        # Phone goes home, router dies: the phone is just offline, the router is a fault.
+        report = cycle(client, cfg, State(self.tmp), scanner=lambda *a, **k: {"10.0.0.2": nas_seen}, oui=oui)
+        d = self.by_ip(report)
+        self.assertEqual((d["10.0.0.7"]["health"], d["10.0.0.7"]["online"], d["10.0.0.7"]["detail"]), ("healthy", False, "Offline"))
+        self.assertEqual((d["10.0.0.1"]["health"], d["10.0.0.1"]["detail"]), ("crit", "Not responding"))
+        assert_contract(self, report)
+
+        # Same phone back on a new address: still one asset.
+        moved = netscan.Host("10.0.0.5", mac="da:a1:19:00:00:01", mdns_names=["Jo's iPhone"])
+        report = cycle(client, cfg, State(self.tmp), scanner=lambda *a, **k: {"10.0.0.2": nas_seen, "10.0.0.5": moved}, oui=oui)
+        phones = [x for x in report["devices"] if x["key"] == "mac:da:a1:19:00:00:01"]
+        self.assertEqual(len(phones), 1)
+        self.assertEqual((phones[0]["ip"], phones[0]["online"]), ("10.0.0.5", True))
+
 
     def test_credentials_never_in_arguments(self):
         cfg = Config(url="https://x", token=TOKEN, targets=["10.0.0.3"], snmp_version="3", snmp_user="lt",
-                     auth_pass="supersecret1", priv_pass="supersecret2", hosts=["10.0.0.3"], state_dir=self.tmp, workers=2)
+                     auth_pass="supersecret1", priv_pass="supersecret2", hosts=["10.0.0.3"], state_dir=self.tmp, workers=2, scan=False)
         fake = FakeAgents({"10.0.0.3": netgear()})
         client = SnmpClient(cfg, runner=fake)
         cycle(client, cfg, State(self.tmp))
