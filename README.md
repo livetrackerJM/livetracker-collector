@@ -99,8 +99,9 @@ volumes:
 Docker Desktop on Windows can't see the local network, so run the collector with Python:
 
 1. Install Python 3.10+ from python.org (tick *Add python.exe to PATH*).
-2. Put the collector folder somewhere, e.g. `C:\LiveTracker\collector` (the folder that contains
-   the `collector` package and `example.env`).
+2. Download <https://github.com/livetrackerJM/livetracker-collector/archive/refs/heads/main.zip>
+   and extract it, e.g. to `C:\LiveTracker\` - you get a folder `livetracker-collector-main`
+   containing the `collector` package and `example.env`. Nothing else to install.
 3. Copy `example.env` to `collector.env` in that folder and fill in `LT_TOKEN`. `LT_TARGETS=auto`
    scans the network the PC is on.
 4. In PowerShell, in that folder:
@@ -173,6 +174,11 @@ guest Wi-Fi, not behind a VPN that captures local traffic), and that Docker runs
 - The LiveTracker key only allows posting this collector's device report. LiveTracker stores a
   hash of it; rotate or revoke it any time from the Connectors page.
 - The container runs as a non-root user; state lives in the `/data` volume.
+
+## Licence
+
+Proprietary - you may run it to report your network to your LiveTracker service. See
+[LICENSE](LICENSE).
 
 ## Development
 
